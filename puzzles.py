@@ -58,15 +58,17 @@ tl.load use mask: [0 1 2 3 4 5 6 7] < 5 = [1 1 1 1 1 0 0 0]
 
 @triton.jit
 def demo1(x_ptr):
-    range = tl.arange(0, 8)
-    # print works in the interpreter
-    print(range)
-    x = tl.load(x_ptr + range, range < 5, 0)
-    print(x)
+    indices = tl.arange(0, 8)
+    # Expected output: [0 1 2 3 4 5 6 7]
+    tl.device_print("1", indices)
+    x = tl.load(x_ptr + indices, indices < 5, 0)
+    # Expected output: [1. 1. 1. 1. 1. 0. 0. 0.]
+    tl.device_print("2", x)
 
 
 def run_demo1():
     print("Demo1 Output: ")
+    # [(1, 1, 1)] is the axis of the 3D launch grid
     demo1[(1, 1, 1)](torch.ones(4, 3))
     print_end_line()
 
@@ -103,18 +105,18 @@ tl.load use mask: i < 4 and j < 3.
 
 @triton.jit
 def demo2(x_ptr):
-    i_range = tl.arange(0, 8)[:, None]
-    j_range = tl.arange(0, 4)[None, :]
+    i_range = tl.arange(0, 8)[:, None] # 用[:, None]操作增加一个纬度，形状为 (8, 1)
+    j_range = tl.arange(0, 4)[None, :] # 用[:, None]操作增加一个纬度，形状为 (1, 4)
     range = i_range * 4 + j_range
     # print works in the interpreter
-    print(range)
+    tl.device_print(range)
     x = tl.load(x_ptr + range, (i_range < 4) & (j_range < 3), 0)
-    print(x)
+    tl.device_print(x)
 
 
 def run_demo2():
     print("Demo2 Output: ")
-    demo2[(1, 1, 1)](torch.ones(4, 4))
+    demo2[(1, 1, 1)](torch.ones(4, 4)).cuda()
     print_end_line()
 
 
@@ -184,7 +186,7 @@ def demo4(x_ptr):
     pid = tl.program_id(0)
     range = tl.arange(0, 8) + pid * 8
     x = tl.load(x_ptr + range, range < 20)
-    print("Print for each", pid, x)
+    tl.device_print("Print for each", pid, x)
 
 
 def run_demo4():
@@ -216,6 +218,8 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
     # Finish me!
+    z = x + 10.0
+    tl.store(z_ptr + off_x, z)
     return
 
 
@@ -236,7 +240,13 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
-    # Finish me!
+    pid = tl.program_id(axis=0)
+    idxs = pid * B0 + tl.arange(0, B0)
+    mask = idxs < N0
+
+    x = tl.load(x_ptr + idxs, mask=mask)
+    z = x + 10.0
+    tl.store(z_ptr + idxs, z, mask=mask)
     return
 
 
@@ -259,6 +269,15 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
+    off_x = tl.arange(0, B0)
+    off_y = tl.arange(0, B1)
+    off_z = off_y[:, None] * N0 + off_x[None, :]  #通过广播机制将off_y和off_x进行组合，生成一个二维的偏移量矩阵。
+
+    x = tl.load(x_ptr + off_x)
+    y = tl.load(y_ptr + off_y)
+    z = x[None, :] + y[:, None] # 通过广播机制，将x和y相加，生成一个二维矩阵z。
+    tl.store(z_ptr + off_z, z)
+
     # Finish me!
     return
 
@@ -286,7 +305,19 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+
+    off_x = block_id_x * B0 + tl.arange(0, B0)
+    off_y = block_id_y * B1 + tl.arange(0, B1)
+    off_z = off_y[:, None] * N0 + off_x[None, :]
+
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    mask_z = mask_y[:, None] & mask_x[None, :]
+
+    x = tl.load(x_ptr + off_x, mask=mask_x)
+    y = tl.load(y_ptr + off_y, mask=mask_y)
+    z = x[None, :] + y[:, None] # 通过广播机制，将x和y相加，生成一个二维矩阵z。
+    tl.store(z_ptr + off_z, z, mask=mask_z)
     return
 
 
@@ -313,7 +344,21 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+
+    off_x = block_id_x * B0 + tl.arange(0, B0)
+    off_y = block_id_y * B1 + tl.arange(0, B1)
+    off_z = off_y[:, None] * N0 + off_x[None, :]
+
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    mask_z = mask_y[:, None] & mask_x[None, :]
+
+    x = tl.load(x_ptr + off_x, mask=mask_x)
+    y = tl.load(y_ptr + off_y, mask=mask_y)
+    z = x[None, :] * y[:, None]
+    z = tl.maximum(z, 0)
+
+    tl.store(z_ptr + off_z, z, mask=mask_z)
     return
 
 
@@ -353,7 +398,23 @@ def mul_relu_block_back_kernel(
 ):
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
-    # Finish me!
+
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    off_j = block_id_j * B1 + tl.arange(0, B1)
+    off_ji = off_j[:, None] * N0 + off_i[None, :]
+
+    mask_i = off_i < N0
+    mask_j = off_j < N1
+    mask_ji = mask_j[:, None] & mask_i[None, :]
+
+    x = tl.load(x_ptr + off_ji, mask=mask_ji)
+    y = tl.load(y_ptr + off_j, mask=mask_j)
+    dz = tl.load(dz_ptr + off_ji, mask=mask_ji)
+
+    df = tl.where(x * y[:, None] > 0, 1.0, 0)
+    dx = df * y[:, None] * dz
+
+    tl.store(dx_ptr + off_ji, dx, mask=mask_ji)
     return
 
 
@@ -378,8 +439,22 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
-    return
+    block_id_i = tl.program_id(0)
+    off_i = tl.arange(0, B0)[:, None] + block_id_i * B0
+
+    # block accumulator
+    acc = tl.zeros((B0, 1), dtype=tl.float32)
+
+    # loop over ceil(T/B1) column blocks
+    for j in tl.range(0, T, B1):
+      off_j = tl.arange(0, B1)[None, :] + j
+
+      off_ij = off_i * T + off_j
+      
+      x_block = tl.load(x_ptr + off_ij, (off_i < N0) & (off_j < T) , other=0)
+      acc += tl.sum(x_block, axis=1)
+
+    tl.store(z_ptr + off_i, acc, (off_i < N0))
 
 
 r"""
@@ -417,10 +492,73 @@ def softmax_spec(x: Float32[4, 200]) -> Float32[4, 200]:
 @triton.jit
 def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     """2 loops ver."""
+    # ============ 2-pass implementation ============
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
-    return
+    off_i = tl.arange(0, B0)[:, None] + block_id_i * B0
+
+    # First Loop: Compute m_i & d_i'
+    x_max = tl.full((B0, ), -float('inf'), dtype=tl.float32)
+    d_i = tl.zeros((B0, ), dtype=tl.float32)
+    for j in range(0, T, B1):
+        off_j = tl.arange(0, B1)[None, :] + j
+        off_ij = off_i * T + off_j
+        x = tl.load(x_ptr + off_ij, (off_i < N0) & (off_j < T) , other=0)
+
+        cur_max = tl.maximum(x_max, tl.max(x, axis=1))
+        x_exp = tl.exp2(log2_e * (x - cur_max[:, None]))
+
+        d_i = tl.exp2(log2_e *(x_max-cur_max)) * d_i + tl.sum(x_exp, axis=1)
+        x_max = cur_max
+    
+    for j in range(0, T, B1):
+        off_j = tl.arange(0, B1)[None, :] + j
+
+        off_ij = off_i * T + off_j
+      
+        x = tl.load(x_ptr + off_ij, (off_i < N0) & (off_j < T) , other=0)
+        x_exp = tl.exp2(log2_e * (x - x_max[:, None]))
+        z = x_exp / d_i
+        tl.store(z_ptr + off_ij, z, (off_i < N0) & (off_j < T))
+
+    # ============ 3-pass implementation ============
+    # block_id_i = tl.program_id(0)
+    # log2_e = 1.44269504
+
+    # off_i = tl.arange(0, B0)[:, None] + block_id_i * B0
+
+    # # First Loop: get x_max
+    # x_max = tl.full((B0, ), -float('inf'), dtype=tl.float32)
+    # for j in range(0, T, B1):
+    #     off_j = tl.arange(0, B1)[None, :] + j
+    #     off_ij = off_i * T + off_j
+      
+    #     x = tl.load(x_ptr + off_ij, (off_i < N0) & (off_j < T) , other=0)
+    #     x_max = tl.maximum(x_max, tl.max(x, axis=1))
+
+    # # Second Loop: get exp sum
+    # exp_sum = tl.zeros((B0, ), dtype=tl.float32)
+    # for j in range(0, T, B1):
+    #     off_j = tl.arange(0, B1)[None, :] + j
+
+    #     off_ij = off_i * T + off_j
+      
+    #     x = tl.load(x_ptr + off_ij, (off_i < N0) & (off_j < T) , other=0)
+    #     x_exp = tl.exp2(log2_e * (x - x_max[:, None]))
+    #     exp_sum += tl.sum(x_exp, axis=1)
+
+    # # Third Loop: calculate exp
+    # for j in range(0, T, B1):
+    #     off_j = tl.arange(0, B1)[None, :] + j
+
+    #     off_ij = off_i * T + off_j
+      
+    #     x = tl.load(x_ptr + off_ij, (off_i < N0) & (off_j < T) , other=0)
+    #     x_exp = tl.exp2(log2_e * (x - x_max[:, None]))
+    #     z = x_exp / exp_sum
+    #     tl.store(z_ptr + off_ij, z, (off_i < N0) & (off_j < T))
+
+    # return
 
 
 @triton.jit
@@ -619,9 +757,9 @@ def quant_dot_kernel(
 
 def run_demos():
     run_demo1()
-    run_demo2()
-    run_demo3()
-    run_demo4()
+    # run_demo2()
+    # run_demo3()
+    # run_demo4()
 
 
 def run_puzzles(args, puzzles: List[int]):
